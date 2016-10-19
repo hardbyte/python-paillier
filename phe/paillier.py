@@ -22,6 +22,9 @@ import random
 import hashlib
 import math
 import sys
+
+from phe.encoding import SharedExponentEncoding
+
 try:
     from collections.abc import Mapping
 except ImportError:
@@ -83,15 +86,13 @@ class PaillierPublicKey(object):
       g (int): part of the public key - see Paillier's paper.
       n (int): part of the public key - see Paillier's paper.
       nsquare (int): :attr:`n` ** 2, stored for frequent use.
-      max_int (int): Maximum int that may safely be stored. This can be
-        increased, if you are happy to redefine "safely" and lower the
-        chance of detecting an integer overflow.
+      max_int (int): Maximum int that may be stored.
     """
     def __init__(self, g, n):
         self.g = g
         self.n = n
         self.nsquare = n * n
-        self.max_int = n // 3 - 1
+        self.max_int = n
 
     def __repr__(self):
         nsquare = self.nsquare.to_bytes(1024, 'big')
@@ -145,22 +146,23 @@ class PaillierPublicKey(object):
         """Return a cryptographically random number less than :attr:`n`"""
         return random.SystemRandom().randrange(1, self.n)
 
-    def encrypt(self, value, precision=None, r_value=None):
+    def encrypt(self, value, encoding_scheme=None, r_value=None, **encoding_args):
         """Encode and Paillier encrypt a real number *value*.
 
         Args:
-          value: an int or float to be encrypted.
-            If int, it must satisfy abs(*value*) < :attr:`n`/3.
-            If float, it must satisfy abs(*value* / *precision*) <<
-            :attr:`n`/3
-            (i.e. if a float is near the limit then detectable
-            overflow may still occur)
-          precision (float): Passed to :meth:`EncodedNumber.encode`.
-            If *value* is a float then *precision* is the maximum
-            **absolute** error allowed when encoding *value*. Defaults
-            to encoding *value* exactly.
+          value: The value to be encrypted. The type and size must be supported
+            by the encoding scheme.
+
+          encoding_scheme (EncodingScheme): The encoding scheme to use
+            to encode *value*. The default scheme will encode int and
+            float but requires the sharing of an exponent.
+
           r_value (int): obfuscator for the ciphertext; by default (i.e.
             if *r_value* is None), a random value is used.
+
+          encoding_args: Any other arguments which are directly passed
+            to :meth:`encoding_scheme.encode`. For example `precision` is
+            supported by the default encoding scheme :class:`SharedExponentEncoding`.
 
         Returns:
           EncryptedNumber: An encryption of *value*.
@@ -173,7 +175,13 @@ class PaillierPublicKey(object):
         if isinstance(value, EncodedNumber):
             encoding = value
         else:
-            encoding = EncodedNumber.encode(self, value, precision)
+            if encoding_scheme is None:
+                encoding_scheme = SharedExponentEncoding()
+
+            if encoding_scheme.valid_type(type(value)):
+                int_repr, public_data = encoding_scheme.encode(self, value, **encoding_args)
+                # TODO remove exponent from EncodedNumber
+                encoding = EncodedNumber(self, int_repr, public_data['exponent'])
 
         return self.encrypt_encoded(encoding, r_value)
 
@@ -364,63 +372,25 @@ class PaillierPrivateKeyring(Mapping):
 
 
 class EncodedNumber(object):
-    """Represents a float or int encoded for Paillier encryption.
+    """Represents some value encoded for Paillier encryption.
 
-    For end users, this class is mainly useful for specifying precision
-    when adding/multiplying an :class:`EncryptedNumber` by a scalar.
+    For end users, this class is mainly useful as an intermediate
+    representation ready to be encrypted using the Paillier
+    cryptosystem.
 
     If you want to manually encode a number for Paillier encryption,
-    then use :meth:`encode`, if de-serializing then use
-    :meth:`__init__`.
+    then use one of the :class:`BaseEncodingScheme` implementations,
+    if de-serializing an EncodedNumber then use :meth:`__init__`.
 
 
     .. note::
         If working with other Paillier libraries you will have to agree on
-        a specific :attr:`BASE` and :attr:`LOG2_BASE` - inheriting from this
-        class and overriding those two attributes will enable this.
+        a specific EncodingScheme. Some encoding schemes include non-secret
+        information required for encoding and decoding. For example fixed
+        point encoding schemes usually raise the value by some `base` and
+        `exponent`.
 
-    Notes:
-      Paillier encryption is only defined for non-negative integers less
-      than :attr:`PaillierPublicKey.n`. Since we frequently want to use
-      signed integers and/or floating point numbers (luxury!), values
-      should be encoded as a valid integer before encryption.
 
-      The operations of addition and multiplication [1]_ must be
-      preserved under this encoding. Namely:
-
-      1. Decode(Encode(a) + Encode(b)) = a + b
-      2. Decode(Encode(a) * Encode(b)) = a * b
-
-      for any real numbers a and b.
-
-      Representing signed integers is relatively easy: we exploit the
-      modular arithmetic properties of the Paillier scheme. We choose to
-      represent only integers between
-      +/-:attr:`~PaillierPublicKey.max_int`, where `max_int` is
-      approximately :attr:`~PaillierPublicKey.n`/3 (larger integers may
-      be treated as floats). The range of values between `max_int` and
-      `n` - `max_int` is reserved for detecting overflows. This encoding
-      scheme supports properties #1 and #2 above.
-
-      Representing floating point numbers as integers is a harder task.
-      Here we use a variant of fixed-precision arithmetic. In fixed
-      precision, you encode by multiplying every float by a large number
-      (e.g. 1e6) and rounding the resulting product. You decode by
-      dividing by that number. However, this encoding scheme does not
-      satisfy property #2 above: upon every multiplication, you must
-      divide by the large number. In a Paillier scheme, this is not
-      possible to do without decrypting. For some tasks, this is
-      acceptable or can be worked around, but for other tasks this can't
-      be worked around.
-
-      In our scheme, the "large number" is allowed to vary, and we keep
-      track of it. It is:
-
-        :attr:`BASE` ** :attr:`exponent`
-
-      One number has many possible encodings; this property can be used
-      to mitigate the leak of information due to the fact that
-      :attr:`exponent` is never encrypted.
 
       For more details, see :meth:`encode`.
 
@@ -442,6 +412,9 @@ class EncodedNumber(object):
         varies)
       encoding (int): The encoded number to store. Must be positive and
         less than :attr:`~PaillierPublicKey.max_int`.
+      scheme (EncodingScheme): The encoding scheme instance used to
+        encode and decode this value.
+
       exponent (int): Together with :attr:`BASE`, determines the level
         of fixed-precision used in encoding the number.
 
@@ -451,6 +424,7 @@ class EncodedNumber(object):
         varies)
       encoding (int): The encoded number to store. Must be positive and
         less than :attr:`~PaillierPublicKey.max_int`.
+
       exponent (int): Together with :attr:`BASE`, determines the level
         of fixed-precision used in encoding the number.
     """
